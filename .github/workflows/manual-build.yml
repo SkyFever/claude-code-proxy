@@ -40,7 +40,7 @@ jobs:
             platform: darwin-amd64
             ext: ""
             
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-arm64
             ext: ""
