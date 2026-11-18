@@ -18,6 +18,11 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - The default bind address is `127.0.0.1`.
 - A non-loopback listener requires an external firewall or authenticating reverse proxy.
 - The proxy stores subscription credentials and can consume account quota, so an exposed listener is equivalent to exposing that capability.
+- The optional LAN Nginx example authenticates one bearer key outside the proxy.
+  It compares the token case-sensitively, returns Anthropic-shaped local 401/403
+  errors with request IDs, and logs local authentication/access failures without
+  recording keys, bodies, or query strings. Configure its key, address, subnet,
+  and trusted TLS certificate before use; the unchanged placeholder denies access.
 
 ## Anthropic API scope
 
@@ -25,7 +30,32 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - `?beta=true` does not select a separate implementation.
 - Token counts are local estimates, not exact upstream tokenizer or billing counts.
 - Claude Code title generation and other structured background requests are forwarded and consume provider tokens.
-- Anthropic-specific fields without a provider mapping can be dropped.
+- The patched Codex Messages translator rejects unsupported top-level content
+  blocks instead of silently dropping them. Other providers retain their upstream
+  behaviors, including potential field drops.
+- The patched Codex bridge **eagerly** registers Anthropic deferred function
+  definitions instead of implementing native tool search. Tool-search tools
+  themselves are not forwarded. Known historical tool-search/web-search result
+  blocks become textual history; this does not recreate Anthropic server tools.
+- Ordinary tool definitions accept an omitted type, Anthropic `custom`, or the
+  existing `function` spelling. A null `output_config.format` means no structured
+  output format, just like an omitted format.
+- A `tool_reference` inside a user `tool_result.content` is validated against
+  the request's tool definitions and preserved as readable history. Missing,
+  empty, or unknown referenced tool names are rejected before upstream dispatch.
+- `strict: true` tool schemas, non-direct `allowed_callers`, unknown tool types,
+  and unknown `output_config.format.type` are rejected by the patched Codex
+  translator rather than silently accepted with weakened semantics.
+- `strict: true` is an unsupported valid feature, not malformed input. Claude
+  Code can surface its rejection to the user; tool-search fallback does not
+  guarantee removing strict mode. The optional
+  `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` client setting reduces the features
+  sent by Claude Code; it does not make the bridge fully equivalent.
+- The unsupported `advisor_20260301` tool receives the documented `Input tag`
+  rejection marker so compatible Claude Code clients can retry without advisor.
+  This does not implement advisor execution.
+- Known nested tool-result image limitations and other Anthropic-only fields
+  **remain non-equivalent**. Review `CC_COMPAT_README.md` before deploying.
 - Native OpenAI Responses passthrough is opt-in and applies to registered Codex models.
 - Codex Images passthrough is separately opt-in, restricted to `gpt-image-2`, and supports generation plus JSON or multipart edits. Variations, masks, remote image URLs, and URL-formatted outputs are unsupported.
 

@@ -488,9 +488,10 @@ fn translate_request_inner(
     opts: TranslateOptions,
     apply_codex_config: bool,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    validate_codex_system(req)?;
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
+    let input = build_input(req)?;
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
@@ -500,7 +501,7 @@ fn translate_request_inner(
         format: None,
     };
 
-    if let Some(fmt) = read_output_format(req) {
+    if let Some(fmt) = read_output_format(req)? {
         text.format = Some(fmt);
     }
 
@@ -624,27 +625,80 @@ fn translate_request_inner(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
-    let output_config = req.extra.get("output_config")?.as_object()?;
-    let format = output_config.get("format")?.as_object()?;
-    let kind = format.get("type")?.as_str()?;
+fn read_output_format(req: &MessagesRequest) -> Result<Option<ResponsesTextFormat>, anyhow::Error> {
+    let Some(output_config) = req.extra.get("output_config") else {
+        return Ok(None);
+    };
+    let config = output_config
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("output_config must be an object"))?;
+    let Some(format) = config.get("format").filter(|format| !format.is_null()) else {
+        return Ok(None);
+    };
+    let format = format
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("output_config.format must be an object"))?;
+    let kind = format
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("output_config.format.type is required"))?;
     match kind {
         "json_schema" => {
             let name = format
                 .get("name")
-                .and_then(|v| v.as_str())
+                .and_then(Value::as_str)
                 .unwrap_or("response")
                 .to_string();
-            let schema = format.get("schema")?;
+            let schema = format
+                .get("schema")
+                .ok_or_else(|| anyhow::anyhow!("output_config.format.schema is required"))?;
             let normalized = normalize_strict_json_schema(schema);
-            Some(ResponsesTextFormat::JsonSchema {
+            Ok(Some(ResponsesTextFormat::JsonSchema {
                 name,
                 schema: normalized,
                 strict: Some(true),
-            })
+            }))
         }
-        "json_object" => Some(ResponsesTextFormat::JsonObject),
-        _ => Some(ResponsesTextFormat::Text),
+        "json_object" => Ok(Some(ResponsesTextFormat::JsonObject)),
+        "text" => Ok(Some(ResponsesTextFormat::Text)),
+        other => anyhow::bail!(
+            "Unsupported Anthropic output_config.format.type: {other}; refusing a lossy conversion"
+        ),
+    }
+}
+
+/// The proxy uses eager tool registration as a *documented fallback* for
+/// Anthropic's tool-search server tools. Codex receives the deferred function
+/// definitions directly; it never sees or emulates Anthropic's search results.
+fn is_tool_search_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tool_search_tool_regex_20251119"
+            | "tool_search_tool_bm25_20251119"
+            | "tool_search_tool_regex"
+            | "tool_search_tool_bm25"
+    )
+}
+
+fn validate_codex_system(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    match req.extra.get("system") {
+        None | Some(Value::String(_)) | Some(Value::Null) => Ok(()),
+        Some(Value::Array(blocks)) => {
+            for (index, block) in blocks.iter().enumerate() {
+                if block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "text")
+                    || block.get("text").and_then(Value::as_str).is_none()
+                {
+                    anyhow::bail!(
+                        "Unsupported or malformed system content block at system[{index}]"
+                    );
+                }
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("system must be text or an array of text blocks"),
     }
 }
 
@@ -652,16 +706,46 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     let Some(tools) = req.extra.get("tools") else {
         return Ok(None);
     };
-    let tools_arr = match tools {
-        Value::Array(a) => a,
-        _ => return Ok(None),
-    };
+    let tools_arr = tools
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tools must be an array; refusing a lossy conversion"))?;
     let mut out = Vec::new();
-    for tool in tools_arr {
-        let tool_type = tool
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("function");
+    for (index, tool) in tools_arr.iter().enumerate() {
+        let tool_type = match tool.get("type") {
+            None => "function",
+            Some(Value::String(kind)) => kind.as_str(),
+            Some(_) => anyhow::bail!("tools[{index}].type must be a string"),
+        };
+        if tool_type == "advisor_20260301" {
+            // Claude Code recognizes this marker and can retry without advisor.
+            // The bridge still does not implement the Anthropic advisor tool.
+            anyhow::bail!(
+                "Input tag 'advisor_20260301' at tools[{index}] is unsupported by the Codex bridge"
+            );
+        }
+        if is_tool_search_type(tool_type) {
+            // Fallback: register deferred functions eagerly. There is no Codex
+            // equivalent of Anthropic's native tool search service.
+            continue;
+        }
+        if tool.get("strict").and_then(Value::as_bool) == Some(true) {
+            anyhow::bail!(
+                "tools[{index}] requests strict schema enforcement, which the Codex bridge cannot guarantee"
+            );
+        }
+        if tool
+            .get("allowed_callers")
+            .and_then(Value::as_array)
+            .is_some_and(|callers| {
+                callers
+                    .iter()
+                    .any(|caller| caller.as_str() != Some("direct"))
+            })
+        {
+            anyhow::bail!(
+                "tools[{index}].allowed_callers requires programmatic tool execution, which is unsupported"
+            );
+        }
         if tool_type == "web_search_20250305" {
             let mut filters = ResponsesWebSearchFilters {
                 allowed_domains: None,
@@ -691,11 +775,12 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 search_content_types: vec!["text".to_string(), "image".to_string()],
                 filters: if has_filters { Some(filters) } else { None },
             }));
-        } else {
+        } else if matches!(tool_type, "function" | "custom") {
             let name = tool
                 .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("tools[{index}].name is required"))?
                 .to_string();
             let description = tool
                 .get("description")
@@ -714,6 +799,10 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 parameters,
                 strict: false,
             }));
+        } else {
+            anyhow::bail!(
+                "Unsupported Anthropic tools[{index}].type: {tool_type}; refusing to advertise it as a function"
+            );
         }
     }
     if out.is_empty() {
@@ -821,16 +910,18 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
                 "auto" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
                 "none" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None),
                 "any" | "required" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required),
-                _ => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+                _ => anyhow::bail!("Unsupported tool_choice: {s}"),
             }));
         }
-        _ => return Ok(None),
+        None | Some(Value::Null) => return Ok(None),
+        Some(_) => anyhow::bail!("tool_choice must be a string or object"),
     };
 
-    let choice_type = choice
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("auto");
+    let choice_type = match choice.get("type") {
+        None => "auto",
+        Some(Value::String(kind)) => kind.as_str(),
+        Some(_) => anyhow::bail!("tool_choice.type must be a string"),
+    };
     match choice_type {
         "auto" => Ok(Some(ResponsesToolChoice::Mode(
             ResponsesToolChoiceMode::Auto,
@@ -842,8 +933,22 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
             ResponsesToolChoiceMode::Required,
         ))),
         "tool" => {
-            let name = choice.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("tool_choice.name is required"))?;
             let tools = req.extra.get("tools").and_then(|v| v.as_array());
+            if tools.is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    is_tool_search_type(tool.get("type").and_then(Value::as_str).unwrap_or(""))
+                        && tool.get("name").and_then(Value::as_str) == Some(name)
+                })
+            }) {
+                anyhow::bail!(
+                    "tool_choice requires an Anthropic tool-search tool; the Codex eager-loading fallback cannot force a search"
+                );
+            }
             let is_web_search = tools.is_some_and(|t| {
                 t.iter().any(|tool| {
                     (tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305"))
@@ -863,16 +968,189 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
                 }))
             }
         }
-        _ => Ok(None),
+        other => anyhow::bail!("Unsupported tool_choice.type: {other}"),
     }
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+/// Convert known Anthropic server-side history blocks into explicit readable
+/// context instead of silently dropping them. This is *not* native server-tool
+/// replay; the remote Codex model receives a historical text record instead.
+/// Unknown blocks fail closed so Claude Code does not silently lose its state.
+fn normalize_codex_content(
+    content: &Value,
+    role: &str,
+    message_index: usize,
+    tool_names: &HashSet<&str>,
+) -> Result<Vec<ContentBlock>, anyhow::Error> {
+    let Value::Array(items) = content else {
+        if content.is_string() {
+            return Ok(normalize_content(content, Value::Null));
+        }
+        anyhow::bail!("messages[{message_index}].content must be text or an array");
+    };
+
+    let mut blocks = Vec::with_capacity(items.len());
+    for (block_index, item) in items.iter().enumerate() {
+        let kind = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing content block type at messages[{message_index}].content[{block_index}]"
+            )
+        })?;
+        match kind {
+            "text" | "image" | "tool_use" | "tool_result" | "thinking" => {
+                let role_valid = match kind {
+                    "tool_use" | "thinking" => role == "assistant",
+                    "tool_result" | "image" => role == "user",
+                    _ => true,
+                };
+                if !role_valid {
+                    anyhow::bail!(
+                        "Unexpected {kind} block in {role} message at messages[{message_index}].content[{block_index}]"
+                    );
+                }
+                // Avoid normalize_content's Option-based silent discard for
+                // partially specified content objects.
+                if kind == "text" && item.get("text").and_then(Value::as_str).is_none() {
+                    anyhow::bail!(
+                        "Missing text at messages[{message_index}].content[{block_index}]"
+                    );
+                }
+                if kind == "image" && item.get("source").and_then(Value::as_object).is_none() {
+                    anyhow::bail!(
+                        "Missing image source at messages[{message_index}].content[{block_index}]"
+                    );
+                }
+                if kind == "tool_use"
+                    && (item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                        || item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_none_or(str::is_empty))
+                {
+                    anyhow::bail!(
+                        "Malformed tool_use at messages[{message_index}].content[{block_index}]"
+                    );
+                }
+                if kind == "tool_result"
+                    && item
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    anyhow::bail!(
+                        "Malformed tool_result at messages[{message_index}].content[{block_index}]"
+                    );
+                }
+                let item = if kind == "tool_result" {
+                    normalize_tool_result_references(item, tool_names, message_index, block_index)?
+                } else {
+                    item.clone()
+                };
+                blocks.extend(normalize_content(&Value::Array(vec![item]), Value::Null));
+            }
+            "server_tool_use" if role == "assistant" => {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("server_tool");
+                let input = item.get("input").cloned().unwrap_or(Value::Null);
+                blocks.push(ContentBlock::Text {
+                    text: format!(
+                        "[Historical Anthropic server tool call: {name}; input: {input}]"
+                    ),
+                });
+            }
+            "web_search_tool_result" | "web_fetch_tool_result" | "tool_search_tool_result"
+                if role == "assistant" =>
+            {
+                let result = item.get("content").cloned().unwrap_or(Value::Null);
+                blocks.push(ContentBlock::Text {
+                    text: format!("[Historical Anthropic {kind}: {result}]"),
+                });
+            }
+            "tool_reference" if role == "assistant" => {
+                let name = item
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                blocks.push(ContentBlock::Text {
+                    text: format!("[Previously discovered tool: {name}; tools are eagerly registered with Codex]")
+                });
+            }
+            _ => anyhow::bail!(
+                "Unsupported Anthropic content block '{kind}' at messages[{message_index}].content[{block_index}]; refusing silent context loss"
+            ),
+        }
+    }
+    Ok(blocks)
+}
+
+/// Custom tool search returns references inside user tool results. Preserve
+/// those names as ordered text for the eager-loading fallback, while letting
+/// the existing renderer continue to handle text, images, and error markers.
+fn normalize_tool_result_references(
+    item: &Value,
+    tool_names: &HashSet<&str>,
+    message_index: usize,
+    block_index: usize,
+) -> Result<Value, anyhow::Error> {
+    let mut normalized = item.clone();
+    let Some(content) = normalized.get_mut("content") else {
+        return Ok(normalized);
+    };
+    let Value::Array(blocks) = content else {
+        if content.get("type").and_then(Value::as_str) == Some("tool_reference") {
+            anyhow::bail!(
+                "Malformed tool_reference at messages[{message_index}].content[{block_index}].content: tool result blocks must be an array"
+            );
+        }
+        return Ok(normalized);
+    };
+    for (result_index, block) in blocks.iter_mut().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_reference") {
+            continue;
+        }
+        let name = block
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Malformed tool_reference at messages[{message_index}].content[{block_index}].content[{result_index}]: tool_name must be a nonempty string"
+                )
+            })?;
+        if !tool_names.contains(name) {
+            anyhow::bail!(
+                "Unknown tool_reference target '{name}' at messages[{message_index}].content[{block_index}].content[{result_index}]: no matching top-level tool definition"
+            );
+        }
+        *block = serde_json::json!({
+            "type": "text",
+            "text": format!(
+                "[Previously discovered tool: {name}; tools are eagerly registered with Codex]"
+            )
+        });
+    }
+    Ok(normalized)
+}
+
+fn build_input(req: &MessagesRequest) -> Result<Vec<ResponsesInputItem>, anyhow::Error> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
+    let tool_names: HashSet<&str> = req
+        .extra
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect();
 
-    for msg in &req.messages {
-        let blocks = normalize_content(&msg.content, Value::Null);
+    for (message_index, msg) in req.messages.iter().enumerate() {
+        let blocks = normalize_codex_content(&msg.content, &msg.role, message_index, &tool_names)?;
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
@@ -946,7 +1224,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                     });
                 }
             }
-            _ => {
+            "assistant" => {
                 let mut text_parts: Vec<ResponsesContentPart> = Vec::new();
                 let flush_text =
                     |out: &mut Vec<ResponsesInputItem>,
@@ -995,10 +1273,11 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                 }
                 flush_text(&mut out, &mut text_parts);
             }
+            other => anyhow::bail!("Unsupported role in messages[{message_index}]: {other}"),
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
