@@ -112,6 +112,13 @@ Run `claude-code-proxy models` for the current catalog or
 > and account enforcement remain under each provider's control. Unofficial
 > clients may carry account risk.
 
+## Personal LAN gateway compatibility branch
+
+This branch adds an **unofficial** Claude Code compatibility hardening layer
+and a single-key, LAN-only Nginx gateway configuration. See
+[CC_COMPAT_README.md](CC_COMPAT_README.md) for setup, regression coverage,
+and remaining Anthropic/Codex protocol limitations.
+
 ## Documentation
 
 - [What is claude-code-proxy?](https://claude-code-proxy.raine.dev/)
